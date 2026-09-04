@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import sys
 import time
 from base64 import urlsafe_b64decode
 from pathlib import Path
@@ -17,6 +18,7 @@ from .constants import BASE_URL, KEYRING_SERVICE_NAME, OWA_URL, USER_AGENT
 from .exceptions import AccountError, AuthRequiredError, TokenExpiredError
 
 TOKEN_STORAGE_BACKEND = "keyring"
+TOKEN_FILE_BACKEND = "file"
 TOKEN_STORAGE_VERSION = 1
 
 
@@ -247,16 +249,27 @@ def _load_cached_token(account_name: str | None = None) -> str | None:
     except json.JSONDecodeError:
         return None
 
-    if "token" in data:
-        token = data["token"]
+    if data.get("storage_backend") == TOKEN_FILE_BACKEND:
+        token = data.get("token")
+        if not token:
+            return None
+    elif "token" in data:
+        # Legacy plaintext token file: migrate to the keyring when possible.
         info = {
             "mailbox_id": data.get("mailbox_id"),
             "email": data.get("email"),
             "display_name": data.get("display_name"),
         }
-        _save_token(token, selected, info)
+        _save_token(data["token"], selected, info)
         data = _load_token_metadata(token_file) or {}
-    token = _load_token_secret(selected)
+        if data.get("storage_backend") == TOKEN_FILE_BACKEND:
+            token = data.get("token")
+            if not token:
+                return None
+        else:
+            token = _load_token_secret(selected)
+    else:
+        token = _load_token_secret(selected)
     expires_at = data.get("expires_at", 0)
     if time.time() > expires_at - 300:
         return None
@@ -279,15 +292,22 @@ def _save_token(token: str, account_name: str | None = None, mailbox_info: dict[
     token_file = account_service.get_account_paths(selected).token_file
     token_file.parent.mkdir(parents=True, exist_ok=True)
     info = mailbox_info or {}
-    _store_token_secret(selected, token)
-    data = {
-        "storage_backend": TOKEN_STORAGE_BACKEND,
+    use_file = not _store_token_secret(selected, token)
+    if use_file:
+        print(
+            f"Warning: could not store token in the keyring; saving it to {token_file} instead.",
+            file=sys.stderr,
+        )
+    data: dict[str, Any] = {
+        "storage_backend": TOKEN_FILE_BACKEND if use_file else TOKEN_STORAGE_BACKEND,
         "storage_version": TOKEN_STORAGE_VERSION,
         "expires_at": _decode_exp(token),
         "mailbox_id": info.get("mailbox_id"),
         "email": info.get("email"),
         "display_name": info.get("display_name"),
     }
+    if use_file:
+        data["token"] = token
     token_file.write_text(json.dumps(data))
     _chmod_600(token_file)
 
@@ -298,8 +318,21 @@ def delete_stored_token(account_name: str | None = None) -> None:
         keyring.delete_password(KEYRING_SERVICE_NAME, _keyring_username(selected))
     except keyring.errors.PasswordDeleteError:
         pass
-    except keyring.errors.KeyringError as exc:
-        raise AccountError(f"Could not delete stored token for account '{selected}': {exc}") from exc
+    except keyring.errors.KeyringError:
+        # Keyring may be unavailable (e.g. no backend installed); file-based
+        # tokens are still cleared below.
+        pass
+    _clear_file_token(selected)
+
+
+def _clear_file_token(account_name: str) -> None:
+    token_file = account_service.get_account_paths(account_name).token_file
+    data = _load_token_metadata(token_file)
+    if not data or data.get("storage_backend") != TOKEN_FILE_BACKEND:
+        return
+    data.pop("token", None)
+    token_file.write_text(json.dumps(data))
+    _chmod_600(token_file)
 
 
 def _load_token_metadata(token_file: Path) -> dict[str, Any] | None:
@@ -315,13 +348,18 @@ def _keyring_username(account_name: str) -> str:
     return f"token:{account_name}"
 
 
-def _store_token_secret(account_name: str, token: str) -> None:
+def _store_token_secret(account_name: str, token: str) -> bool:
+    """Store the token in the keyring. Returns False when it cannot be stored.
+
+    The Windows Credential Manager backend rejects secrets longer than 1280
+    bytes (CredWrite error 1783), which real M365 JWTs exceed. Callers fall
+    back to file-based storage when this returns False.
+    """
     try:
         keyring.set_password(KEYRING_SERVICE_NAME, _keyring_username(account_name), token)
-    except keyring.errors.KeyringError as exc:
-        raise AccountError(
-            f"Could not store token securely for account '{account_name}'. Check keyring availability."
-        ) from exc
+    except Exception:
+        return False
+    return True
 
 
 def _load_token_secret(account_name: str) -> str:

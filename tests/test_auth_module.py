@@ -236,6 +236,43 @@ def test_save_token_writes_expected_payload(monkeypatch, tmp_path):
     assert chmod_calls == [paths.token_file]
 
 
+def test_save_token_falls_back_to_file_when_keyring_fails(monkeypatch, tmp_path):
+    paths = _patch_account(monkeypatch, tmp_path)
+    store = _patch_keyring(monkeypatch)
+    monkeypatch.setattr(auth.keyring, "set_password", lambda *args, **kwargs: (_ for _ in ()).throw(Exception("error(1783, 'CredWrite', 'The stub received bad data.')")))
+    monkeypatch.setattr(auth, "_decode_exp", lambda _token: 1234.0)
+    long_token = "t" * 2000
+
+    auth._save_token(long_token, mailbox_info={"mailbox_id": "m-1", "email": "u@example.com", "display_name": "User"})
+
+    saved = json.loads(paths.token_file.read_text())
+    assert saved["storage_backend"] == "file"
+    assert saved["token"] == long_token
+    assert not store
+
+
+def test_load_cached_token_reads_file_backend_token(monkeypatch, tmp_path):
+    paths = _patch_account(monkeypatch, tmp_path)
+    _patch_keyring(monkeypatch)
+    monkeypatch.setattr(auth.time, "time", lambda: 1_000)
+    monkeypatch.setattr(auth, "_assert_token_matches_account", lambda *args, **kwargs: {})
+
+    paths.token_file.write_text(
+        json.dumps(
+            {
+                "storage_backend": "file",
+                "storage_version": 1,
+                "token": "file-token",
+                "expires_at": 2_000,
+                "mailbox_id": None,
+                "email": None,
+                "display_name": None,
+            }
+        )
+    )
+    assert auth._load_cached_token() == "file-token"
+
+
 def test_load_cached_token_migrates_legacy_plaintext_token(monkeypatch, tmp_path):
     paths = _patch_account(monkeypatch, tmp_path)
     store = _patch_keyring(monkeypatch)
@@ -260,6 +297,57 @@ def test_load_cached_token_migrates_legacy_plaintext_token(monkeypatch, tmp_path
     assert "token" not in migrated
     assert migrated["storage_backend"] == "keyring"
     assert migrated["email"] == "user@example.com"
+
+
+def test_legacy_migration_falls_back_to_file_when_keyring_fails(monkeypatch, tmp_path):
+    paths = _patch_account(monkeypatch, tmp_path)
+    store = _patch_keyring(monkeypatch)
+    monkeypatch.setattr(auth.keyring, "set_password", lambda *args, **kwargs: (_ for _ in ()).throw(Exception("error(1783, 'CredWrite', 'The stub received bad data.')")))
+    monkeypatch.setattr(auth.time, "time", lambda: 1_000)
+    monkeypatch.setattr(auth, "_assert_token_matches_account", lambda *args, **kwargs: {})
+
+    paths.token_file.write_text(
+        json.dumps(
+            {
+                "token": "legacy-token",
+                "expires_at": 2_000,
+                "mailbox_id": "mailbox-1",
+                "email": "user@example.com",
+                "display_name": "User",
+            }
+        )
+    )
+
+    assert auth._load_cached_token() == "legacy-token"
+    migrated = json.loads(paths.token_file.read_text())
+    assert migrated["storage_backend"] == "file"
+    assert migrated["token"] == "legacy-token"
+    assert not store
+
+
+def test_delete_stored_token_clears_file_token(monkeypatch, tmp_path):
+    paths = _patch_account(monkeypatch, tmp_path)
+    _patch_keyring(monkeypatch)
+
+    paths.token_file.write_text(
+        json.dumps(
+            {
+                "storage_backend": "file",
+                "storage_version": 1,
+                "token": "file-token",
+                "expires_at": 2_000,
+                "mailbox_id": None,
+                "email": None,
+                "display_name": None,
+            }
+        )
+    )
+
+    auth.delete_stored_token()
+
+    remaining = json.loads(paths.token_file.read_text())
+    assert "token" not in remaining
+    assert remaining["storage_backend"] == "file"
 
 
 def test_load_cached_token_requires_keyring_secret(monkeypatch, tmp_path):
